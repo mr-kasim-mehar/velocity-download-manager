@@ -23,5 +23,8 @@ jobs:
         run: npm ci
       - name: Type-check and build the web UI
         run: npm run build
+      - name: Package browser extension resource
+        shell: powershell
+        run: ./scripts/package-extension.ps1
       - name: Check Rust backend
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml
