@@ -1,0 +1,16 @@
+node_modules/
+dist/
+src-tauri/target/
+*.log
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+src-tauri/vendor-downloads/
+src-tauri/tools/*.exe
+src-tauri/tools/yt-dlp
+src-tauri/tools/aria2c
+src-tauri/tools/deno
+src-tauri/tools/ffmpeg
+src-tauri/tools/ffprobe
+src-tauri/browser-extension.zip

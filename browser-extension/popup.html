@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="stylesheet" href="popup.css">
+  <title>Velocity</title>
+</head>
+<body>
+  <header><img src="icons/velocity-128.png" alt=""><div><strong>Velocity</strong><span>Browser companion</span></div></header>
+  <p>Send the current video page to Velocity with your preferred output.</p>
+  <label>Output<select id="mode"><option value="video">Video + audio</option><option value="audio">Audio only</option></select></label>
+  <label id="resolution-row">Maximum resolution<select id="resolution"><option value="best">Best available</option><option value="2160p">2160p (4K)</option><option value="1440p">1440p (2K)</option><option value="1080p">1080p (Full HD)</option><option value="720p">720p (HD)</option><option value="480p">480p</option><option value="360p">360p</option></select></label>
+  <label id="audio-row" hidden>Audio format<select id="audio-format"><option value="mp3">MP3</option><option value="m4a">M4A</option><option value="aac">AAC</option><option value="opus">Opus</option><option value="flac">FLAC</option><option value="wav">WAV</option></select></label>
+  <button id="download" type="button">Download current video</button>
+  <small id="status">Velocity must be installed on this computer.</small>
+  <script src="popup.js"></script>
+</body>
+</html>

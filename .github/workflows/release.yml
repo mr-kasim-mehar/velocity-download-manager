@@ -1,0 +1,166 @@
+name: Build, sign, and publish desktop installers
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+      SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+      SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+      SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+      SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install JavaScript dependencies
+        run: npm ci
+      - name: Download and verify bundled tools
+        shell: powershell
+        run: ./scripts/prepare-windows-tools.ps1
+      - name: Package browser extension
+        shell: powershell
+        run: ./scripts/package-extension.ps1
+      - name: Build Windows installers
+        uses: tauri-apps/tauri-action@v0
+        with:
+          args: --bundles nsis,msi
+      - name: Stage unsigned installers
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force release/windows-unsigned | Out-Null
+          Get-ChildItem src-tauri/target/release/bundle -Recurse -File |
+            Where-Object { $_.Extension -in '.exe', '.msi' } |
+            Copy-Item -Destination release/windows-unsigned
+          if (-not (Get-ChildItem release/windows-unsigned -File)) { throw 'No Windows installers were produced.' }
+      - name: Upload unsigned artifact for SignPath
+        id: unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: velocity-windows-unsigned
+          path: release/windows-unsigned/*
+          if-no-files-found: error
+          retention-days: 7
+      - name: Detect SignPath configuration
+        id: signing
+        shell: powershell
+        run: |
+          $configured = [bool]($env:SIGNPATH_API_TOKEN -and $env:SIGNPATH_ORGANIZATION_ID -and $env:SIGNPATH_PROJECT_SLUG -and $env:SIGNPATH_SIGNING_POLICY_SLUG)
+          "configured=$($configured.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+      - name: Submit installers to SignPath
+        if: steps.signing.outputs.configured == 'true' && startsWith(github.ref, 'refs/tags/')
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: release/windows-signed
+      - name: Prepare publishable Windows artifacts
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force release/windows | Out-Null
+          if ('${{ steps.signing.outputs.configured }}' -eq 'true' -and '${{ startsWith(github.ref, 'refs/tags/') }}' -eq 'true') {
+            Get-ChildItem release/windows-signed -Recurse -File |
+              Where-Object { $_.Extension -in '.exe', '.msi' } |
+              Copy-Item -Destination release/windows
+          } else {
+            Get-ChildItem release/windows-unsigned -File | ForEach-Object {
+              $target = Join-Path 'release/windows' ($_.BaseName + '-unsigned' + $_.Extension)
+              Copy-Item -LiteralPath $_.FullName -Destination $target
+            }
+          }
+          if (-not (Get-ChildItem release/windows -File)) { throw 'No publishable Windows installers were found.' }
+      - name: Upload publishable Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: velocity-windows
+          path: release/windows/*
+          if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2 libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf zip
+      - name: Install JavaScript dependencies
+        run: npm ci
+      - name: Prepare bundled tools and extension
+        run: |
+          ./scripts/prepare-linux-tools.sh
+          ./scripts/package-extension.sh
+      - name: Build Linux packages
+        uses: tauri-apps/tauri-action@v0
+        with:
+          args: --bundles deb,appimage
+      - name: Stage Linux packages
+        run: |
+          mkdir -p release/linux
+          find src-tauri/target/release/bundle -type f \( -name '*.deb' -o -name '*.AppImage' \) -exec cp '{}' release/linux/ \;
+          test -n "$(find release/linux -maxdepth 1 -type f -print -quit)"
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: velocity-linux
+          path: release/linux/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [windows, linux]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download Windows packages
+        uses: actions/download-artifact@v4
+        with:
+          name: velocity-windows
+          path: release
+      - name: Download Linux packages
+        uses: actions/download-artifact@v4
+        with:
+          name: velocity-linux
+          path: release
+      - name: Generate checksums
+        working-directory: release
+        run: sha256sum * > SHA256SUMS.txt
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" release/* \
+            --repo "${{ github.repository }}" \
+            --title "Velocity ${{ github.ref_name }}" \
+            --generate-notes \
+            --verify-tag
