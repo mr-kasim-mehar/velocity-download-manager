@@ -7,18 +7,32 @@ TEMP="$(mktemp -d)"
 trap 'rm -rf "$TEMP"' EXIT
 mkdir -p "$TOOLS"
 
-curl -fL --retry 4 --retry-delay 2 \
-  https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp \
-  -o "$TOOLS/yt-dlp"
-curl -fL --retry 4 --retry-delay 2 \
-  https://github.com/denoland/deno/releases/download/v2.9.7/deno-x86_64-unknown-linux-gnu.zip \
-  -o "$TEMP/deno.zip"
+download_verified() {
+  local url="$1"
+  local destination="$2"
+  local sha256="$3"
+  curl -fL --retry 4 --retry-delay 2 "$url" -o "$destination"
+  echo "$sha256  $destination" | sha256sum --check --status || {
+    echo "SHA-256 mismatch for $destination" >&2
+    exit 1
+  }
+}
+
+download_verified \
+  "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp" \
+  "$TOOLS/yt-dlp" \
+  "1fa6733c37ea6fb51c99ad8fe785e7b7e5f3246c9b980230329d4fb72ed8d4d6"
+download_verified \
+  "https://github.com/denoland/deno/releases/download/v2.9.7/deno-x86_64-unknown-linux-gnu.zip" \
+  "$TEMP/deno.zip" \
+  "c6527f24f4b16031d3ae4fa9f658d5f11534c8d84ce7dc8502420280919c3490"
 unzip -q "$TEMP/deno.zip" -d "$TEMP/deno"
 cp "$TEMP/deno/deno" "$TOOLS/deno"
 
-curl -fL --retry 4 --retry-delay 2 \
-  https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz \
-  -o "$TEMP/ffmpeg.tar.xz"
+download_verified \
+  "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz" \
+  "$TEMP/ffmpeg.tar.xz" \
+  "ffa15db386dca7f89cfa8574849f8d3e77c80ba3d17f57c4eb01d9e133272988"
 mkdir -p "$TEMP/ffmpeg"
 tar -xf "$TEMP/ffmpeg.tar.xz" -C "$TEMP/ffmpeg"
 find "$TEMP/ffmpeg" -type f -name ffmpeg -exec cp '{}' "$TOOLS/ffmpeg" \;

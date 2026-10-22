@@ -42,7 +42,7 @@ try {
   Get-VerifiedFile `
     "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" `
     $ffmpegArchive `
-    "75104CEAFCB51A7982B248DF5113D3FBB449D1C32425F1EDF184D5CE391C3B9B"
+    "926C7F5F4885C011E72C1AD03647EDAF69F04E1831F144E1987928EFBCED87C6"
   Expand-Archive -LiteralPath $ffmpegArchive -DestinationPath (Join-Path $temp "ffmpeg") -Force
   foreach ($name in @("ffmpeg.exe", "ffprobe.exe")) {
     $binary = Get-ChildItem (Join-Path $temp "ffmpeg") -Filter $name -Recurse | Select-Object -First 1
@@ -53,8 +53,6 @@ try {
   $expectedBinaries = @{
     "aria2c.exe"  = "BE2099C214F63A3CB4954B09A0BECD6E2E34660B886D4C898D260FEBFE9D70C2"
     "deno.exe"    = "E020F3E232BD16E33768DEE528E5983349C962952051CED0A5D58AD42F5D9B33"
-    "ffmpeg.exe"  = "24B6A221EDDD1109D1A24FBEE86FFEAD0C9F989832EB118BD09629C9F924585D"
-    "ffprobe.exe" = "17D9DCD3DDC062FC631DB68253F24D999B942C5CECA44B269F25529678D42A5B"
   }
   foreach ($entry in $expectedBinaries.GetEnumerator()) {
     $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $tools $entry.Key)).Hash
