@@ -42,8 +42,9 @@ workflow downloads known versions on a clean runner, verifies the Windows files
 with SHA-256, packages the browser extension, and then builds native installers.
 
 Run `.github/workflows/release.yml` manually to test the build, or push a version
-tag such as `v0.4.2` to publish Windows `.exe`/`.msi` and Linux `.deb`/AppImage
-packages with a `SHA256SUMS.txt` manifest.
+tag such as `v0.4.2` to publish Windows `.exe` and `.msi` packages with a
+`SHA256SUMS.txt` manifest. Linux packaging is temporarily excluded from public
+releases while its dependency compatibility is being updated.
 
 ## Downloads and Windows trust
 
