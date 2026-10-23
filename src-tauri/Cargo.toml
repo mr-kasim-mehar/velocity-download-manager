@@ -1,6 +1,6 @@
 [package]
 name = "velocity"
-version = "0.4.2"
+version = "0.4.3"
 description = "A fast, friendly cross-platform download manager"
 authors = ["Muhammad Qasim"]
 license = "MIT"

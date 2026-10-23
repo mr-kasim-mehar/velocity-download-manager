@@ -33,6 +33,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install JavaScript dependencies
         run: npm ci
+      - name: Resolve official FFmpeg asset digest
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $releaseJson = gh api repos/yt-dlp/FFmpeg-Builds/releases/tags/latest
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read the official FFmpeg release metadata.' }
+          $release = $releaseJson | ConvertFrom-Json
+          $asset = $release.assets | Where-Object { $_.name -eq 'ffmpeg-master-latest-win64-gpl.zip' } | Select-Object -First 1
+          if (-not $asset -or $asset.digest -notmatch '^sha256:[0-9a-fA-F]{64}$') { throw 'The official FFmpeg asset has no valid SHA-256 digest.' }
+          $sha256 = $asset.digest.Substring(7).ToUpperInvariant()
+          "VELOCITY_FFMPEG_SHA256=$sha256" | Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Download and verify bundled tools
         shell: powershell
         run: ./scripts/prepare-windows-tools.ps1

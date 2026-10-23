@@ -39,10 +39,16 @@ try {
   Copy-Item -LiteralPath $aria.FullName -Destination $tools -Force
 
   $ffmpegArchive = Join-Path $temp "ffmpeg.zip"
+  $ffmpegSha256 = if ($env:VELOCITY_FFMPEG_SHA256) {
+    $env:VELOCITY_FFMPEG_SHA256.ToUpperInvariant()
+  } else {
+    "139735E4EDAB069746FFBACCF5C21BC85435947F74DC6DC65CEBDD21FDA824D4"
+  }
+  if ($ffmpegSha256 -notmatch '^[0-9A-F]{64}$') { throw "VELOCITY_FFMPEG_SHA256 is not a valid SHA-256 digest" }
   Get-VerifiedFile `
     "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" `
     $ffmpegArchive `
-    "926C7F5F4885C011E72C1AD03647EDAF69F04E1831F144E1987928EFBCED87C6"
+    $ffmpegSha256
   Expand-Archive -LiteralPath $ffmpegArchive -DestinationPath (Join-Path $temp "ffmpeg") -Force
   foreach ($name in @("ffmpeg.exe", "ffprobe.exe")) {
     $binary = Get-ChildItem (Join-Path $temp "ffmpeg") -Filter $name -Recurse | Select-Object -First 1

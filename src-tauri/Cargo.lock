@@ -4489,7 +4489,7 @@ dependencies = [
 
 [[package]]
 name = "velocity"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "dirs 6.0.0",
  "futures-util",
