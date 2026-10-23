@@ -149,8 +149,9 @@ function detail(item: DownloadItem): string {
     const etaSeconds = item.total && item.speed > 0 ? (item.total - item.downloaded) / item.speed : 0;
     const eta = etaSeconds > 0 ? ` · ${etaSeconds < 60 ? Math.ceil(etaSeconds) + " sec" : Math.ceil(etaSeconds / 60) + " min"} remaining` : "";
     const peers = item.source_type === "torrent" && item.peers !== null ? ` · ${item.peers} peers` : "";
+    const connections = item.source_type === "direct" && item.connections ? ` · ${item.connections} connections` : "";
     const warning = item.source_type === "torrent" && item.speed === 0 && item.error ? ` · ${item.error}` : "";
-    return `${progress} · ${formatBytes(item.speed)}/s${peers}${eta}${warning}`;
+    return `${progress} · ${formatBytes(item.speed)}/s${connections}${peers}${eta}${warning}`;
   }
   if (item.status === "completed") return `${formatBytes(item.downloaded)} · Saved to ${item.destination}`;
   if (item.status === "failed") return item.error || "Download failed";

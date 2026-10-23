@@ -11,6 +11,7 @@ export interface DownloadItem {
   speed: number;
   progress: number | null;
   peers: number | null;
+  connections: number | null;
   status: DownloadStatus;
   source_type: SourceType;
   media_mode: "video" | "audio";

@@ -4,7 +4,9 @@
 [![MIT License](https://img.shields.io/badge/license-MIT-22c55e.svg)](LICENSE)
 [![Latest release](https://img.shields.io/github/v/release/mr-kasim-mehar/velocity-download-manager)](https://github.com/mr-kasim-mehar/velocity-download-manager/releases)
 
-Velocity is a native cross-platform download manager for Windows and Linux. It supports resumable HTTP downloads, supported media pages through yt-dlp, magnet links and `.torrent` files through aria2, persistent history, pause/resume controls, transfer speed and ETA, configurable download locations, native file import, and a professional desktop UI.
+Velocity is a native cross-platform download manager for Windows and Linux. It supports accelerated and resumable HTTP downloads, supported media pages through yt-dlp, magnet links and `.torrent` files through aria2, persistent history, pause/resume controls, transfer speed and ETA, configurable download locations, native file import, and a professional desktop UI.
+
+Large direct HTTP files use four or eight bounded-memory range connections when the server supports them. Velocity starts conservatively on slow servers, retries an unstable eight-connection transfer with four connections, and transparently falls back to a normal resumable stream when byte ranges are unavailable or unreliable. Incomplete segment files stay in Velocity's application cache rather than the user's Downloads folder.
 
 Velocity is free and open-source software developed by **Muhammad Qasim**,
 security researcher, application developer, and ethical hacker. The complete
@@ -42,7 +44,7 @@ workflow downloads known versions on a clean runner, verifies the Windows files
 with SHA-256, packages the browser extension, and then builds native installers.
 
 Run `.github/workflows/release.yml` manually to test the build, or push a version
-tag such as `v0.4.4` to publish Windows `.exe` and `.msi` packages with a
+tag such as `v0.5.0` to publish Windows `.exe` and `.msi` packages with a
 `SHA256SUMS.txt` manifest and signed `latest.json` updater feed. Linux packaging is temporarily excluded from public
 releases while its dependency compatibility is being updated.
 

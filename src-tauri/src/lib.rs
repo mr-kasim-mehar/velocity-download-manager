@@ -1,5 +1,5 @@
 use futures_util::StreamExt;
-use reqwest::header::RANGE;
+use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_RANGE, LAST_MODIFIED, RANGE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -36,6 +36,8 @@ struct DownloadItem {
     progress: Option<f64>,
     #[serde(default)]
     peers: Option<u64>,
+    #[serde(default)]
+    connections: Option<u8>,
     status: String,
     #[serde(default = "default_source_type")]
     source_type: String,
@@ -265,7 +267,514 @@ fn emit_item(app: &AppHandle, item: &DownloadItem) {
     let _ = app.emit("download-progress", item);
 }
 
+const DIRECT_BUFFER_SIZE: usize = 256 * 1024;
+const MIN_SEGMENTED_FILE_SIZE: u64 = 8 * 1024 * 1024;
+const EIGHT_CONNECTION_FILE_SIZE: u64 = 64 * 1024 * 1024;
+const SLOW_RANGE_PROBE: std::time::Duration = std::time::Duration::from_millis(1200);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ByteRange {
+    start: u64,
+    end: u64,
+}
+
+#[derive(Debug)]
+struct RangeProbe {
+    total: u64,
+    validator: Option<String>,
+    elapsed: std::time::Duration,
+}
+
+#[derive(Debug)]
+enum SegmentError {
+    Paused,
+    RangeUnsupported(String),
+    Transfer(String),
+}
+
+struct SegmentRequest {
+    client: reqwest::Client,
+    url: String,
+    validator: Option<String>,
+    expected_total: u64,
+    range: ByteRange,
+    path: PathBuf,
+}
+
+#[derive(Clone)]
+struct SegmentControl {
+    downloaded: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    abort: Arc<AtomicBool>,
+}
+
+struct SegmentedAttempt<'a> {
+    app: &'a AppHandle,
+    manager: &'a Arc<DownloadManager>,
+    item: &'a DownloadItem,
+    client: &'a reqwest::Client,
+    probe: &'a RangeProbe,
+    staging: &'a Path,
+    part_path: &'a Path,
+    final_path: &'a Path,
+}
+
+fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
+    let value = value.strip_prefix("bytes ")?;
+    let (range, total) = value.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.parse().ok()?;
+    let end = end.parse().ok()?;
+    let total = total.parse().ok()?;
+    (start <= end && end < total).then_some((start, end, total))
+}
+
+fn build_segment_ranges(total: u64, count: usize) -> Vec<ByteRange> {
+    let count = count.max(1).min(total.max(1) as usize);
+    let base = total / count as u64;
+    let remainder = total % count as u64;
+    let mut start = 0_u64;
+    (0..count)
+        .map(|index| {
+            let length = base + u64::from((index as u64) < remainder);
+            let range = ByteRange {
+                start,
+                end: start + length - 1,
+            };
+            start += length;
+            range
+        })
+        .collect()
+}
+
+fn choose_segment_count(total: u64, probe_elapsed: std::time::Duration) -> Option<usize> {
+    if total < MIN_SEGMENTED_FILE_SIZE {
+        None
+    } else if total >= EIGHT_CONNECTION_FILE_SIZE && probe_elapsed <= SLOW_RANGE_PROBE {
+        Some(8)
+    } else {
+        Some(4)
+    }
+}
+
+async fn probe_range_support(client: &reqwest::Client, url: &str) -> Option<RangeProbe> {
+    let started = std::time::Instant::now();
+    let response = client
+        .get(url)
+        .header(RANGE, "bytes=0-0")
+        .send()
+        .await
+        .ok()?;
+    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        return None;
+    }
+    let content_range = response.headers().get(CONTENT_RANGE)?.to_str().ok()?;
+    let (start, end, total) = parse_content_range(content_range)?;
+    if start != 0 || end != 0 {
+        return None;
+    }
+    let validator = response
+        .headers()
+        .get(ETAG)
+        .or_else(|| response.headers().get(LAST_MODIFIED))
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    Some(RangeProbe {
+        total,
+        validator,
+        elapsed: started.elapsed(),
+    })
+}
+
+fn direct_staging_dir(app: &AppHandle, id: &str) -> PathBuf {
+    app.path()
+        .app_cache_dir()
+        .unwrap_or_else(|_| std::env::temp_dir().join("velocity"))
+        .join("direct")
+        .join(id)
+}
+
+fn segment_path(staging: &Path, range: &ByteRange) -> PathBuf {
+    staging.join(format!("segment-{}-{}.part", range.start, range.end))
+}
+
+async fn download_segment_inner(
+    request: SegmentRequest,
+    control: SegmentControl,
+) -> Result<(), SegmentError> {
+    let SegmentRequest {
+        client,
+        url,
+        validator,
+        expected_total,
+        range,
+        path,
+    } = request;
+    let length = range.end - range.start + 1;
+    let mut existing = fs::metadata(&path)
+        .await
+        .map(|value| value.len())
+        .unwrap_or(0);
+    if existing > length {
+        let _ = fs::remove_file(&path).await;
+        existing = 0;
+    }
+    if existing == length {
+        return Ok(());
+    }
+    if control.stop.load(Ordering::Relaxed) {
+        return Err(SegmentError::Paused);
+    }
+    if control.abort.load(Ordering::Relaxed) {
+        return Err(SegmentError::Transfer("segment attempt cancelled".into()));
+    }
+
+    let requested_start = range.start + existing;
+    let mut request = client
+        .get(&url)
+        .header(RANGE, format!("bytes={requested_start}-{}", range.end));
+    if let Some(validator) = validator {
+        request = request.header(IF_RANGE, validator);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| SegmentError::Transfer(error.to_string()))?;
+    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Err(SegmentError::RangeUnsupported(format!(
+            "server returned HTTP {} for a byte range",
+            response.status()
+        )));
+    }
+    let returned_range = response
+        .headers()
+        .get(CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_content_range)
+        .ok_or_else(|| SegmentError::RangeUnsupported("invalid Content-Range response".into()))?;
+    if returned_range != (requested_start, range.end, expected_total) {
+        return Err(SegmentError::RangeUnsupported(
+            "server returned a different byte range".into(),
+        ));
+    }
+    let expected = range.end - requested_start + 1;
+    if response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|value| value != expected)
+    {
+        return Err(SegmentError::RangeUnsupported(
+            "server returned an unexpected range length".into(),
+        ));
+    }
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await
+        .map_err(|error| SegmentError::Transfer(error.to_string()))?;
+    let mut written = existing;
+    let mut stream = response.bytes_stream();
+    while let Some(result) = stream.next().await {
+        if control.stop.load(Ordering::Relaxed) {
+            return Err(SegmentError::Paused);
+        }
+        if control.abort.load(Ordering::Relaxed) {
+            return Err(SegmentError::Transfer("segment attempt cancelled".into()));
+        }
+        let chunk = result.map_err(|error| SegmentError::Transfer(error.to_string()))?;
+        for bounded in chunk.chunks(DIRECT_BUFFER_SIZE) {
+            if written + bounded.len() as u64 > length {
+                return Err(SegmentError::RangeUnsupported(
+                    "server sent bytes outside the requested range".into(),
+                ));
+            }
+            file.write_all(bounded)
+                .await
+                .map_err(|error| SegmentError::Transfer(error.to_string()))?;
+            written += bounded.len() as u64;
+            control
+                .downloaded
+                .fetch_add(bounded.len() as u64, Ordering::Relaxed);
+        }
+    }
+    file.flush()
+        .await
+        .map_err(|error| SegmentError::Transfer(error.to_string()))?;
+    if written != length {
+        return Err(SegmentError::Transfer(format!(
+            "range ended early ({written} of {length} bytes)"
+        )));
+    }
+    Ok(())
+}
+
+async fn download_segment(
+    request: SegmentRequest,
+    control: SegmentControl,
+) -> Result<(), SegmentError> {
+    let result = download_segment_inner(request, control.clone()).await;
+    if matches!(
+        result,
+        Err(SegmentError::RangeUnsupported(_)) | Err(SegmentError::Transfer(_))
+    ) {
+        control.abort.store(true, Ordering::Relaxed);
+    }
+    result
+}
+
+async fn run_segmented_attempt(
+    context: SegmentedAttempt<'_>,
+    count: usize,
+    stop: Arc<AtomicBool>,
+) -> Result<(), SegmentError> {
+    let SegmentedAttempt {
+        app,
+        manager,
+        item,
+        client,
+        probe,
+        staging,
+        part_path,
+        final_path,
+    } = context;
+    fs::create_dir_all(staging)
+        .await
+        .map_err(|error| SegmentError::Transfer(error.to_string()))?;
+    let ranges = build_segment_ranges(probe.total, count);
+    let mut initial = 0_u64;
+    for range in &ranges {
+        let path = segment_path(staging, range);
+        let length = range.end - range.start + 1;
+        let existing = fs::metadata(&path)
+            .await
+            .map(|value| value.len())
+            .unwrap_or(0);
+        if existing > length {
+            let _ = fs::remove_file(path).await;
+        } else {
+            initial += existing;
+        }
+    }
+    let downloaded = Arc::new(AtomicU64::new(initial));
+    let abort = Arc::new(AtomicBool::new(false));
+    if let Some(current) = manager.update(&item.id, |download| {
+        download.status = "downloading".into();
+        download.downloaded = initial;
+        download.total = Some(probe.total);
+        download.progress = Some(initial as f64 / probe.total as f64 * 100.0);
+        download.connections = Some(count as u8);
+        download.error = None;
+    }) {
+        emit_item(app, &current);
+    }
+
+    let tasks: Vec<_> = ranges
+        .iter()
+        .map(|range| {
+            tokio::spawn(download_segment(
+                SegmentRequest {
+                    client: client.clone(),
+                    url: item.url.clone(),
+                    validator: probe.validator.clone(),
+                    expected_total: probe.total,
+                    range: range.clone(),
+                    path: segment_path(staging, range),
+                },
+                SegmentControl {
+                    downloaded: downloaded.clone(),
+                    stop: stop.clone(),
+                    abort: abort.clone(),
+                },
+            ))
+        })
+        .collect();
+    let joined = futures_util::future::join_all(tasks);
+    tokio::pin!(joined);
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(350));
+    let mut last_bytes = initial;
+    let mut last_tick = std::time::Instant::now();
+    let results = loop {
+        tokio::select! {
+            results = &mut joined => break results,
+            _ = ticker.tick() => {
+                let current_bytes = downloaded.load(Ordering::Relaxed);
+                let elapsed = last_tick.elapsed().as_secs_f64();
+                let speed = if elapsed > 0.0 { (current_bytes.saturating_sub(last_bytes)) as f64 / elapsed } else { 0.0 };
+                if let Some(current) = manager.update(&item.id, |download| {
+                    download.downloaded = current_bytes;
+                    download.total = Some(probe.total);
+                    download.speed = speed;
+                    download.progress = Some(current_bytes as f64 / probe.total as f64 * 100.0);
+                }) {
+                    emit_item(app, &current);
+                }
+                last_bytes = current_bytes;
+                last_tick = std::time::Instant::now();
+            }
+        }
+    };
+    for result in results {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error),
+            Err(error) => return Err(SegmentError::Transfer(error.to_string())),
+        }
+    }
+    if stop.load(Ordering::Relaxed) {
+        return Err(SegmentError::Paused);
+    }
+
+    let mut output = fs::File::create(part_path)
+        .await
+        .map_err(|error| SegmentError::Transfer(error.to_string()))?;
+    for range in &ranges {
+        let mut input = fs::File::open(segment_path(staging, range))
+            .await
+            .map_err(|error| SegmentError::Transfer(error.to_string()))?;
+        tokio::io::copy(&mut input, &mut output)
+            .await
+            .map_err(|error| SegmentError::Transfer(error.to_string()))?;
+    }
+    output
+        .flush()
+        .await
+        .map_err(|error| SegmentError::Transfer(error.to_string()))?;
+    drop(output);
+    let merged_length = fs::metadata(part_path)
+        .await
+        .map_err(|error| SegmentError::Transfer(error.to_string()))?
+        .len();
+    if merged_length != probe.total {
+        return Err(SegmentError::Transfer(format!(
+            "assembled file has {merged_length} of {} bytes",
+            probe.total
+        )));
+    }
+    if final_path.exists() {
+        let _ = fs::remove_file(final_path).await;
+    }
+    fs::rename(part_path, final_path)
+        .await
+        .map_err(|error| SegmentError::Transfer(error.to_string()))?;
+    let _ = fs::remove_dir_all(staging).await;
+    if let Some(current) = manager.update(&item.id, |download| {
+        download.status = "completed".into();
+        download.downloaded = probe.total;
+        download.total = Some(probe.total);
+        download.speed = 0.0;
+        download.progress = Some(100.0);
+        download.connections = None;
+    }) {
+        emit_item(app, &current);
+    }
+    manager.save();
+    Ok(())
+}
+
 async fn run_direct_download(
+    app: AppHandle,
+    manager: Arc<DownloadManager>,
+    id: String,
+    stop: Arc<AtomicBool>,
+) {
+    let Some(item) = manager.items.lock().unwrap().get(&id).cloned() else {
+        return;
+    };
+    let destination = PathBuf::from(&item.destination);
+    if let Err(error) = fs::create_dir_all(&destination).await {
+        fail(
+            &app,
+            &manager,
+            &id,
+            format!("Cannot create download folder: {error}"),
+        );
+        return;
+    }
+    let part_path = destination.join(format!("{}.velocity-part", item.filename));
+    if fs::metadata(&part_path)
+        .await
+        .map(|value| value.len())
+        .unwrap_or(0)
+        > 0
+    {
+        run_single_connection(app, manager, id, stop).await;
+        return;
+    }
+    let client = match reqwest::Client::builder()
+        .user_agent("Velocity/0.5.0")
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            fail(&app, &manager, &id, error.to_string());
+            return;
+        }
+    };
+    let Some(probe) = probe_range_support(&client, &item.url).await else {
+        run_single_connection(app, manager, id, stop).await;
+        return;
+    };
+    let Some(mut count) = choose_segment_count(probe.total, probe.elapsed) else {
+        run_single_connection(app, manager, id, stop).await;
+        return;
+    };
+    let staging = direct_staging_dir(&app, &id);
+    let final_path = destination.join(&item.filename);
+    loop {
+        match run_segmented_attempt(
+            SegmentedAttempt {
+                app: &app,
+                manager: &manager,
+                item: &item,
+                client: &client,
+                probe: &probe,
+                staging: &staging,
+                part_path: &part_path,
+                final_path: &final_path,
+            },
+            count,
+            stop.clone(),
+        )
+        .await
+        {
+            Ok(()) => return,
+            Err(SegmentError::Paused) => {
+                if let Some(current) = manager.update(&id, |download| {
+                    download.status = "paused".into();
+                    download.speed = 0.0;
+                    download.connections = None;
+                }) {
+                    emit_item(&app, &current);
+                }
+                manager.save();
+                return;
+            }
+            Err(SegmentError::RangeUnsupported(reason)) | Err(SegmentError::Transfer(reason)) => {
+                let _ = fs::remove_dir_all(&staging).await;
+                if count > 4 {
+                    count = 4;
+                    if let Some(current) = manager.update(&id, |download| {
+                        download.error = Some(format!(
+                            "Server was unstable; reduced to {count} connections ({reason})"
+                        ));
+                    }) {
+                        emit_item(&app, &current);
+                    }
+                    continue;
+                }
+                run_single_connection(app, manager, id, stop).await;
+                return;
+            }
+        }
+    }
+}
+
+async fn run_single_connection(
     app: AppHandle,
     manager: Arc<DownloadManager>,
     id: String,
@@ -288,7 +797,7 @@ async fn run_direct_download(
     let part_path = destination.join(format!("{}.velocity-part", item.filename));
     let mut offset = fs::metadata(&part_path).await.map(|m| m.len()).unwrap_or(0);
     let client = match reqwest::Client::builder()
-        .user_agent("Velocity/0.4.2")
+        .user_agent("Velocity/0.5.0")
         .redirect(reqwest::redirect::Policy::limited(10))
         .build()
     {
@@ -336,6 +845,7 @@ async fn run_direct_download(
         d.downloaded = offset;
         d.total = total;
         d.progress = total.map(|value| offset as f64 / value as f64 * 100.0);
+        d.connections = Some(1);
         d.error = None;
     }) {
         emit_item(&app, &current);
@@ -346,6 +856,7 @@ async fn run_direct_download(
             if let Some(current) = manager.update(&id, |d| {
                 d.status = "paused".into();
                 d.speed = 0.0;
+                d.connections = None;
             }) {
                 emit_item(&app, &current);
             }
@@ -364,12 +875,14 @@ async fn run_direct_download(
                 return;
             }
         };
-        if let Err(error) = file.write_all(&chunk).await {
-            fail(&app, &manager, &id, format!("Cannot write file: {error}"));
-            return;
+        for bounded in chunk.chunks(DIRECT_BUFFER_SIZE) {
+            if let Err(error) = file.write_all(bounded).await {
+                fail(&app, &manager, &id, format!("Cannot write file: {error}"));
+                return;
+            }
+            downloaded += bounded.len() as u64;
+            window_bytes += bounded.len() as u64;
         }
-        downloaded += chunk.len() as u64;
-        window_bytes += chunk.len() as u64;
         let elapsed = window_start.elapsed();
         if elapsed.as_millis() >= 350 {
             let speed = window_bytes as f64 / elapsed.as_secs_f64();
@@ -403,6 +916,7 @@ async fn run_direct_download(
         d.total = Some(total.unwrap_or(downloaded));
         d.speed = 0.0;
         d.progress = Some(100.0);
+        d.connections = None;
     }) {
         emit_item(&app, &current);
     }
@@ -1124,6 +1638,7 @@ fn fail(app: &AppHandle, manager: &DownloadManager, id: &str, message: String) {
     if let Some(current) = manager.update(id, |d| {
         d.status = "failed".into();
         d.speed = 0.0;
+        d.connections = None;
         d.error = Some(message);
     }) {
         emit_item(app, &current);
@@ -1195,6 +1710,7 @@ fn add_download(
         speed: 0.0,
         progress: None,
         peers: None,
+        connections: None,
         status: "queued".into(),
         source_type: "direct".into(),
         media_mode: default_media_mode(),
@@ -1344,6 +1860,7 @@ fn create_source(
         speed: 0.0,
         progress: None,
         peers: None,
+        connections: None,
         status: if kind == "direct" {
             "queued"
         } else {
@@ -1502,9 +2019,14 @@ async fn remove_download(
             Path::new(&item.destination).join(format!("{}.velocity-part", item.filename)),
         );
     }
-    if item.source_type == "media" {
+    if matches!(item.source_type.as_str(), "media" | "direct") {
         if let Ok(cache) = app.path().app_cache_dir() {
-            let _ = fs::remove_dir_all(cache.join("media").join(&id)).await;
+            let kind = if item.source_type == "media" {
+                "media"
+            } else {
+                "direct"
+            };
+            let _ = fs::remove_dir_all(cache.join(kind).join(&id)).await;
         }
     }
     manager.save();
@@ -1643,6 +2165,46 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+
+    fn serve_once(
+        status: &str,
+        headers: &[(&str, &str)],
+        body: &'static [u8],
+    ) -> (String, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = status.to_string();
+        let headers: Vec<(String, String)> = headers
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request_bytes = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request_bytes.extend_from_slice(&buffer[..read]);
+                if request_bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request_bytes).into_owned();
+            let mut response = format!("HTTP/1.1 {status}\r\nConnection: close\r\n");
+            for (name, value) in headers {
+                response.push_str(&format!("{name}: {value}\r\n"));
+            }
+            response.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+            request
+        });
+        (format!("http://{address}/file.bin"), handle)
+    }
 
     #[test]
     fn sanitizes_platform_unsafe_filename_characters() {
@@ -1690,6 +2252,113 @@ mod tests {
             available_filename(Path::new("Z:/path-that-does-not-exist"), "file.zip"),
             "file.zip"
         );
+    }
+
+    #[test]
+    fn parses_only_valid_content_ranges() {
+        assert_eq!(parse_content_range("bytes 0-0/100"), Some((0, 0, 100)));
+        assert_eq!(parse_content_range("bytes 25-49/100"), Some((25, 49, 100)));
+        assert_eq!(parse_content_range("bytes 50-25/100"), None);
+        assert_eq!(parse_content_range("bytes */100"), None);
+        assert_eq!(parse_content_range("items 0-0/100"), None);
+    }
+
+    #[test]
+    fn segment_ranges_cover_the_file_without_gaps() {
+        for count in [4, 8] {
+            let ranges = build_segment_ranges(101, count);
+            assert_eq!(ranges.len(), count);
+            assert_eq!(ranges.first().unwrap().start, 0);
+            assert_eq!(ranges.last().unwrap().end, 100);
+            assert!(ranges
+                .windows(2)
+                .all(|pair| pair[0].end + 1 == pair[1].start));
+            assert_eq!(
+                ranges
+                    .iter()
+                    .map(|range| range.end - range.start + 1)
+                    .sum::<u64>(),
+                101
+            );
+        }
+    }
+
+    #[test]
+    fn chooses_adaptive_connection_count() {
+        assert_eq!(
+            choose_segment_count(MIN_SEGMENTED_FILE_SIZE - 1, std::time::Duration::ZERO),
+            None
+        );
+        assert_eq!(
+            choose_segment_count(MIN_SEGMENTED_FILE_SIZE, std::time::Duration::ZERO),
+            Some(4)
+        );
+        assert_eq!(
+            choose_segment_count(EIGHT_CONNECTION_FILE_SIZE, std::time::Duration::ZERO),
+            Some(8)
+        );
+        assert_eq!(
+            choose_segment_count(EIGHT_CONNECTION_FILE_SIZE, SLOW_RANGE_PROBE * 2),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn probes_real_range_support_and_rejects_ignored_ranges() {
+        let (supported_url, supported_server) = serve_once(
+            "206 Partial Content",
+            &[("Content-Range", "bytes 0-0/10"), ("ETag", "\"v1\"")],
+            b"0",
+        );
+        let client = reqwest::Client::new();
+        let probe = tauri::async_runtime::block_on(probe_range_support(&client, &supported_url));
+        assert!(probe.is_some(), "206 response should enable segmentation");
+        let probe = probe.unwrap();
+        assert_eq!(probe.total, 10);
+        assert_eq!(probe.validator.as_deref(), Some("\"v1\""));
+        let request = supported_server.join().unwrap();
+        assert!(request.contains("range: bytes=0-0") || request.contains("Range: bytes=0-0"));
+
+        let (ignored_url, ignored_server) = serve_once("200 OK", &[], b"0123456789");
+        assert!(
+            tauri::async_runtime::block_on(probe_range_support(&client, &ignored_url)).is_none()
+        );
+        let _ = ignored_server.join().unwrap();
+    }
+
+    #[test]
+    fn downloads_only_the_requested_segment() {
+        let (url, server) = serve_once(
+            "206 Partial Content",
+            &[("Content-Range", "bytes 2-5/10")],
+            b"2345",
+        );
+        let root =
+            std::env::temp_dir().join(format!("velocity-range-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("segment.part");
+        let downloaded = Arc::new(AtomicU64::new(0));
+        let result = tauri::async_runtime::block_on(download_segment(
+            SegmentRequest {
+                client: reqwest::Client::new(),
+                url,
+                validator: None,
+                expected_total: 10,
+                range: ByteRange { start: 2, end: 5 },
+                path: path.clone(),
+            },
+            SegmentControl {
+                downloaded: downloaded.clone(),
+                stop: Arc::new(AtomicBool::new(false)),
+                abort: Arc::new(AtomicBool::new(false)),
+            },
+        ));
+        assert!(result.is_ok(), "segment failed: {result:?}");
+        assert_eq!(std::fs::read(path).unwrap(), b"2345");
+        assert_eq!(downloaded.load(Ordering::Relaxed), 4);
+        let request = server.join().unwrap();
+        assert!(request.contains("range: bytes=2-5") || request.contains("Range: bytes=2-5"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

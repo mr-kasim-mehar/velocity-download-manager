@@ -28,6 +28,10 @@ The application does not bypass DRM, paywalls, authentication, or access control
 
 - Stream HTTP(S) response bodies directly to disk.
 - Resume partial files when the server supports byte ranges.
+- Split eligible files across four or eight validated HTTP range requests.
+- Reduce eight-connection transfers to four after instability and use four connections for slow range probes.
+- Fall back to a normal single resumable connection when ranges are unsupported or unreliable.
+- Keep per-connection write buffers at 256 KB and keep segment staging outside the user's destination folder.
 - Follow a bounded number of redirects.
 - Preserve partial data on pause, network failure, and app shutdown.
 - Show transferred bytes, total size when known, instantaneous speed, progress, and ETA.
@@ -93,6 +97,7 @@ The application does not bypass DRM, paywalls, authentication, or access control
 ### NFR-01 — Memory efficiency (priority)
 
 - Stream network data in bounded chunks; never load a complete download into memory.
+- Limit direct-download writes to 256 KB per active connection (at most 2 MB across eight connection buffers).
 - Keep only job metadata and a small progress window in the UI process.
 - Keep UI event payloads compact and emit progress no more than a few times per second.
 - Run media/torrent engines only while their jobs are active.
@@ -145,7 +150,7 @@ The application does not bypass DRM, paywalls, authentication, or access control
 
 ## 4. Acceptance criteria for the current milestone
 
-1. A direct file URL downloads into the default Downloads directory and can be paused and resumed.
+1. A direct file URL downloads into the default Downloads directory, uses four or eight ranges when supported, falls back to one connection when needed, and can be paused and resumed.
 2. A YouTube URL downloads through the bundled media worker at the requested maximum resolution or audio format, reports byte speed and percentage, and reports a meaningful failure when the source is unavailable.
 3. A magnet link and a local `.torrent` file start through the bundled torrent worker and report total bytes, progress, speed, connected peers, and tracker/engine failures.
 4. A user can change and persist the default destination, or override it for one job.
