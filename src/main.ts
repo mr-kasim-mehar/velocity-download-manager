@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openPath, openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { check, type Update } from "@tauri-apps/plugin-updater";
 import type { AppSettings, DownloadItem, SourceType } from "./types";
 
 type Filter = "all" | "active" | "completed" | "failed";
@@ -11,6 +12,8 @@ let settings: AppSettings = { default_destination: "" };
 let filter: Filter = "all";
 let query = "";
 let selectedType: SourceType | "auto" = "auto";
+let availableUpdate: Update | null = null;
+let checkingForUpdate = false;
 
 const icons: Record<string, string> = {
   download: '<svg viewBox="0 0 24 24"><path d="M12 3v12m0 0 5-5m-5 5-5-5M5 21h14"/></svg>',
@@ -100,11 +103,23 @@ app.innerHTML = `
     <div class="dialog-header"><div><h2>Settings</h2><p>General download preferences</p></div><button class="icon-button close-settings" type="button">${icon("close")}</button></div>
     <section class="setting-section"><h3>Download location</h3><p>New downloads are saved here unless you choose another folder for an individual job.</p><div class="folder-input"><div class="input-with-icon">${icon("folder")}<input id="default-destination" readonly></div><button type="button" class="button secondary" id="browse-default">Change</button></div></section>
     <section class="setting-section"><h3>Browser integration</h3><p>Add an IDM-style Download this video button to Chrome, Edge, Opera GX, Brave, and Firefox.</p><div class="setting-row"><div><strong>Velocity Download Companion</strong><span>Open the packaged extension and follow its installation guide.</span></div><button type="button" class="button secondary" id="open-browser-extension">Open package</button></div></section>
+    <section class="setting-section"><h3>Software updates</h3><p>Velocity checks GitHub for new Windows releases when the app starts. Updates are installed only after you approve them.</p><div class="setting-row"><div><strong>Automatic update checks</strong><span id="update-status">Checking is enabled</span></div><button type="button" class="button secondary" id="check-for-updates">Check now</button></div></section>
     <section class="setting-section"><h3>Resource usage</h3><div class="setting-row"><div><strong>Memory-efficient transfers</strong><span>Files stream directly to disk in bounded chunks.</span></div><span class="status-pill good">Enabled</span></div><div class="setting-row"><div><strong>Local processing</strong><span>History and URLs remain on this device.</span></div><span class="status-pill good">Enabled</span></div></section>
     <section class="setting-section about-section"><h3>About Velocity</h3><div class="developer-card"><div class="developer-avatar">MQ</div><div class="developer-details"><strong>Muhammad Qasim</strong><span>Security researcher · Application developer · Ethical hacker</span><p>Velocity is free to use. Built with a focus on privacy, performance, and accessible downloading.</p></div><button type="button" class="button secondary" id="open-developer-instagram">Instagram ${icon("external")}</button></div></section>
     <p class="form-error" id="settings-error"></p>
     <div class="dialog-actions"><button type="button" class="button secondary close-settings">Cancel</button><button type="submit" class="button primary">Save changes</button></div>
   </form>
+</div>
+<div class="overlay hidden" id="update-overlay">
+  <section class="dialog update-dialog" role="dialog" aria-modal="true" aria-labelledby="update-title">
+    <div class="update-symbol">${icon("download")}</div>
+    <h2 id="update-title">A new Velocity update is available</h2>
+    <p class="update-version" id="update-version"></p>
+    <p class="update-notes" id="update-notes"></p>
+    <div class="update-progress hidden" id="update-progress"><div><span id="update-progress-label">Preparing download…</span><span id="update-progress-value"></span></div><progress id="update-progress-bar" max="100"></progress></div>
+    <p class="form-error" id="update-error"></p>
+    <div class="dialog-actions"><button type="button" class="button secondary" id="update-later">Not now</button><button type="button" class="button primary" id="install-update">Download and install</button></div>
+  </section>
 </div>
 <div class="toast" id="toast"></div>`;
 
@@ -217,9 +232,92 @@ async function chooseFolder(target: HTMLInputElement): Promise<void> { const fol
 async function importTorrent(): Promise<void> { const file = await openDialog({ multiple: false, directory: false, title: "Import torrent", filters: [{ name: "BitTorrent metadata", extensions: ["torrent"] }] }); if (typeof file === "string") openSourceDialog("torrent", file); }
 async function refresh(): Promise<void> { downloads = await invoke<DownloadItem[]>("list_downloads"); render(); }
 
+function showUpdate(update: Update): void {
+  el("#update-version").textContent = `Version ${update.version} is ready (installed: ${update.currentVersion}).`;
+  el("#update-notes").textContent = update.body?.trim() || "This release includes improvements and fixes. Your downloads and settings will be preserved.";
+  el("#update-error").textContent = "";
+  el("#update-progress").classList.add("hidden");
+  el<HTMLButtonElement>("#install-update").disabled = false;
+  el<HTMLButtonElement>("#update-later").disabled = false;
+  el("#update-overlay").classList.remove("hidden");
+}
+
+async function checkForUpdates(manual: boolean): Promise<void> {
+  if (checkingForUpdate) return;
+  checkingForUpdate = true;
+  const button = el<HTMLButtonElement>("#check-for-updates");
+  const status = el("#update-status");
+  button.disabled = true;
+  status.textContent = "Checking GitHub…";
+  try {
+    const update = await check({ timeout: 20_000 });
+    if (availableUpdate && availableUpdate !== update) await availableUpdate.close().catch(() => undefined);
+    availableUpdate = update;
+    if (update) {
+      status.textContent = `Version ${update.version} is available`;
+      showUpdate(update);
+    } else {
+      status.textContent = "Velocity is up to date";
+      if (manual) toast("You have the latest version");
+    }
+  } catch (error) {
+    status.textContent = "Could not check for updates";
+    if (manual) toast(`Update check failed: ${String(error)}`);
+  } finally {
+    checkingForUpdate = false;
+    button.disabled = false;
+  }
+}
+
+async function installUpdate(): Promise<void> {
+  if (!availableUpdate) return;
+  const installButton = el<HTMLButtonElement>("#install-update");
+  const laterButton = el<HTMLButtonElement>("#update-later");
+  const progress = el("#update-progress");
+  const progressBar = el<HTMLProgressElement>("#update-progress-bar");
+  const progressLabel = el("#update-progress-label");
+  const progressValue = el("#update-progress-value");
+  installButton.disabled = true;
+  laterButton.disabled = true;
+  progress.classList.remove("hidden");
+  el("#update-error").textContent = "";
+  let downloaded = 0;
+  let total = 0;
+  try {
+    await availableUpdate.downloadAndInstall((event) => {
+      if (event.event === "Started") {
+        total = event.data.contentLength ?? 0;
+        progressBar.removeAttribute("value");
+        progressLabel.textContent = "Downloading update…";
+        progressValue.textContent = total ? `0 of ${formatBytes(total)}` : "";
+      } else if (event.event === "Progress") {
+        downloaded += event.data.chunkLength;
+        if (total) {
+          progressBar.value = Math.min(100, downloaded / total * 100);
+          progressValue.textContent = `${formatBytes(downloaded)} of ${formatBytes(total)}`;
+        } else {
+          progressValue.textContent = formatBytes(downloaded);
+        }
+      } else {
+        progressBar.value = 100;
+        progressLabel.textContent = "Download verified. Starting installer…";
+        progressValue.textContent = "100%";
+      }
+    }, { timeout: 10 * 60_000, restartAfterInstall: true });
+  } catch (error) {
+    el("#update-error").textContent = `Update failed: ${String(error)}`;
+    progressLabel.textContent = "Installation did not complete";
+    installButton.disabled = false;
+    laterButton.disabled = false;
+  }
+}
+
 el("#add-source").addEventListener("click", () => openSourceDialog());
 el("#import-torrent").addEventListener("click", () => void importTorrent());
 el("#open-settings").addEventListener("click", openSettings);
+el("#check-for-updates").addEventListener("click", () => void checkForUpdates(true));
+el("#update-later").addEventListener("click", () => el("#update-overlay").classList.add("hidden"));
+el("#install-update").addEventListener("click", () => void installUpdate());
 document.querySelectorAll(".close-dialog").forEach((button) => button.addEventListener("click", closeSourceDialog));
 document.querySelectorAll(".close-settings").forEach((button) => button.addEventListener("click", closeSettings));
 el("#source-overlay").addEventListener("click", (event) => { if (event.target === el("#source-overlay")) closeSourceDialog(); });
@@ -275,5 +373,6 @@ async function initialize(): Promise<void> {
   await listen<string>("browser-handoff", ({ payload }) => { toast(payload); void refresh(); });
   await listen<DownloadItem>("download-progress", ({ payload }) => { const index = downloads.findIndex((item) => item.id === payload.id); if (index >= 0) downloads[index] = payload; else downloads.unshift(payload); render(); });
   await refresh();
+  window.setTimeout(() => void checkForUpdates(false), 1_500);
 }
 void initialize().catch((error) => toast(`Startup error: ${String(error)}`));

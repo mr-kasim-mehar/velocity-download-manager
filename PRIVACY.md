@@ -4,6 +4,12 @@ Velocity Download Manager does not include analytics, advertising, or
 telemetry. Download history, preferences, and the selected download directory
 are stored locally on the user's device.
 
+On startup, installed Windows builds request the public update manifest from
+the project's GitHub Releases page. This request contains the network metadata
+normally sent with an HTTPS request, such as the user's IP address, but no
+download history, settings, analytics identifier, or browsing activity. An
+update is downloaded only after the user approves it.
+
 When the user starts a download, Velocity connects to the URL or peer network
 the user selected. Media downloads may use the bundled yt-dlp, Deno, and FFmpeg
 tools. Torrent downloads use aria2 and necessarily exchange network data with

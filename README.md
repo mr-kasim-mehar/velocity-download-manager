@@ -17,7 +17,7 @@ Use Velocity only for content you own or are authorized to download. It does not
 
 ## Development
 
-Requirements: Node.js 20+, Rust 1.77+, and the [Tauri system prerequisites](https://v2.tauri.app/start/prerequisites/) for your operating system.
+Requirements: Node.js 20+, Rust 1.90+, and the [Tauri system prerequisites](https://v2.tauri.app/start/prerequisites/) for your operating system.
 
 ```bash
 npm install
@@ -42,9 +42,16 @@ workflow downloads known versions on a clean runner, verifies the Windows files
 with SHA-256, packages the browser extension, and then builds native installers.
 
 Run `.github/workflows/release.yml` manually to test the build, or push a version
-tag such as `v0.4.2` to publish Windows `.exe` and `.msi` packages with a
-`SHA256SUMS.txt` manifest. Linux packaging is temporarily excluded from public
+tag such as `v0.4.4` to publish Windows `.exe` and `.msi` packages with a
+`SHA256SUMS.txt` manifest and signed `latest.json` updater feed. Linux packaging is temporarily excluded from public
 releases while its dependency compatibility is being updated.
+
+Installed builds check the official GitHub release feed shortly after startup.
+When a newer version is available, Velocity shows the version and release notes
+and waits for the user to approve the download and installation. Update bundles
+use Tauri's free cryptographic signatures even while the Windows installers
+remain Authenticode-unsigned; this updater signature verifies integrity but does
+not suppress Windows SmartScreen warnings.
 
 ## Downloads and Windows trust
 

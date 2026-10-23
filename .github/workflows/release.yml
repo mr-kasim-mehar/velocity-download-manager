@@ -22,6 +22,8 @@ jobs:
       SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
       SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
       SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
     steps:
       - uses: actions/checkout@v4
         with:
@@ -105,6 +107,14 @@ jobs:
             }
           }
           if (-not (Get-ChildItem release/windows -File)) { throw 'No publishable Windows installers were found.' }
+          $version = (Get-Content src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          Get-ChildItem release/windows -File |
+            Where-Object { $_.Extension -in '.exe', '.msi' } |
+            ForEach-Object {
+              npm run tauri signer sign -- $_.FullName --app-version $version
+              if ($LASTEXITCODE -ne 0) { throw "Could not create updater signature for $($_.Name)." }
+            }
+          if (-not (Get-ChildItem release/windows -Filter '*.exe.sig' -File)) { throw 'No signed Windows updater artifact was produced.' }
       - name: Upload publishable Windows artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -122,6 +132,28 @@ jobs:
         with:
           name: velocity-windows
           path: release
+      - name: Generate updater manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          installer="$(find release -maxdepth 1 -type f -name '*.exe' -print -quit)"
+          if [[ -z "$installer" || ! -f "$installer.sig" ]]; then
+            echo "A Windows NSIS installer and its updater signature are required." >&2
+            exit 1
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          asset_name="$(basename "$installer")"
+          asset_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${asset_name}"
+          signature="$(cat "$installer.sig")"
+          published_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          jq -n \
+            --arg version "$version" \
+            --arg notes "Velocity ${version} is available. See the GitHub release page for full release notes." \
+            --arg published_at "$published_at" \
+            --arg url "$asset_url" \
+            --arg signature "$signature" \
+            '{version: $version, notes: $notes, pub_date: $published_at, platforms: {"windows-x86_64": {url: $url, signature: $signature}}}' \
+            > release/latest.json
       - name: Generate checksums
         working-directory: release
         run: sha256sum * > SHA256SUMS.txt
